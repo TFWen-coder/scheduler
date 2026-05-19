@@ -1,0 +1,360 @@
+<!--
+  ══════════════════════════════════════════════════════════════
+  獸醫院排班系統 — Phase 2：UI 骨架與休假輸入
+  ══════════════════════════════════════════════════════════════
+
+  ⚠️  重要：如何開啟此頁面
+  ──────────────────────────────────────────────────────────────
+  此頁面使用 ES Module（<script type="module">）。
+  直接雙擊用 file:// 協定開啟時，瀏覽器會因跨域限制報錯
+  （TypeError: Failed to resolve module specifier）。
+
+  請用以下任一方式，透過 HTTP 伺服器開啟：
+
+  方法 1 — VS Code Live Server（推薦，最簡單）
+    1. 在 VS Code 安裝 "Live Server" 擴充套件
+    2. 右鍵點擊 index.html → Open with Live Server
+    3. 瀏覽器自動開啟 http://127.0.0.1:5500
+
+  方法 2 — Python（不需額外安裝）
+    在此資料夾開終端機，執行：
+      python -m http.server 8080
+    然後瀏覽器開啟：http://localhost:8080
+
+  方法 3 — Node.js npx serve
+      npx serve .
+    然後開啟終端機顯示的網址
+
+  ──────────────────────────────────────────────────────────────
+  進度：
+    Phase 1  data.js（資料模型）               ✅ 完成
+    Phase 2  index.html + ui.js（UI 與休假輸入）✅ 完成  ← 目前
+    Phase 3  scheduler.js（排班演算法）         🔲 尚未開始
+  ══════════════════════════════════════════════════════════════
+-->
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>獸醫院排班系統</title>
+  <style>
+    /* ── 全域重置 ── */
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, "Microsoft JhengHei", "微軟正黑體", sans-serif;
+      font-size: 13px;
+      background: #eef0f3;
+      color: #1a1a1a;
+      line-height: 1.4;
+    }
+
+    /* ── 頂部控制列（固定在頂端） ── */
+    #controls {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 7px 16px;
+      background: #2c3e50;
+      color: #ecf0f1;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+      white-space: nowrap;
+    }
+
+    #controls h1 {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+    }
+
+    #controls .divider {
+      width: 1px;
+      height: 20px;
+      background: rgba(255, 255, 255, 0.25);
+    }
+
+    #controls label {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 13px;
+    }
+
+    #controls select {
+      padding: 3px 8px;
+      border: none;
+      border-radius: 4px;
+      font-size: 13px;
+      background: #fff;
+      color: #222;
+      cursor: pointer;
+    }
+
+    #controls select:focus {
+      outline: 2px solid #3498db;
+    }
+
+    #btn-clear {
+      padding: 4px 14px;
+      background: #c0392b;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    #btn-clear:hover { background: #a93226; }
+
+    /* 當前年月顯示，推到最右側 */
+    #current-label {
+      margin-left: auto;
+      font-size: 14px;
+      font-weight: 700;
+      opacity: 0.9;
+    }
+
+    /* ── 表格外容器（雙向捲動） ── */
+    #table-wrapper {
+      overflow: auto;
+      /* 減去頂部控制列高度，讓 sticky header 能正常運作 */
+      max-height: calc(100vh - 44px);
+      padding: 12px 12px 32px;
+    }
+
+    /* ── 排班主表格 ── */
+    #schedule-table {
+      border-collapse: collapse;
+      /* fixed 讓每欄寬度由標頭格決定，不受內容撐寬 */
+      table-layout: fixed;
+      background: #fff;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    }
+
+    /* ── 表頭列（sticky top） ── */
+    thead th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #34495e;
+      color: #ecf0f1;
+      padding: 5px 2px;
+      text-align: center;
+      font-weight: 600;
+      border-bottom: 2px solid #2c3e50;
+    }
+
+    /* ── 姓名欄（sticky left） ── */
+    .col-name,
+    .cell-name {
+      position: sticky;
+      left: 0;
+      z-index: 1;
+      background: #f0f2f5;
+      width: 72px;
+      min-width: 72px;
+      max-width: 72px;
+      padding: 4px 8px;
+      text-align: left;
+      font-weight: 600;
+      /* 視覺上的分隔線 */
+      border-right: 2px solid #c5ccd5;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* 左上角：同時 sticky top + sticky left，z-index 要最高 */
+    thead .col-name {
+      z-index: 3;
+      background: #2c3e50;
+      color: #ecf0f1;
+      text-align: center;
+    }
+
+    /* ── 日期欄（標頭） ── */
+    .col-day {
+      width: 34px;
+      min-width: 34px;
+      max-width: 34px;
+      font-size: 11px;
+      line-height: 1.2;
+      padding: 3px 1px;
+    }
+
+    /* 星期縮寫（日期下方較小字） */
+    .wd-label {
+      display: block;
+      font-size: 10px;
+      opacity: 0.72;
+      font-weight: 400;
+    }
+
+    /* ── 一般日期格子（tbody） ── */
+    .cell-day {
+      width: 34px;
+      min-width: 34px;
+      max-width: 34px;
+      height: 30px;
+      text-align: center;
+      vertical-align: middle;
+      border: 1px solid #e8eaed;
+      font-size: 12px;
+      /* 防止選取文字 */
+      user-select: none;
+    }
+
+    /* 可點擊格子顯示手指游標 */
+    .cell-day:not(.disabled) { cursor: pointer; }
+
+    /* Hover 高亮（黃底 + 橘色外框，不蓋住禁用格） */
+    .cell-day:not(.disabled):hover {
+      background: #fff9c4 !important;
+      outline: 2px solid #e6a817;
+      outline-offset: -2px;
+    }
+
+    /* 週六、週日淺藍底 */
+    .weekend { background-color: #e8f4fd; }
+
+    /* 禁用格：較深灰底，不可點擊 */
+    .cell-day.disabled {
+      background: #d5d8dc !important;
+      cursor: not-allowed;
+    }
+
+    /* 休假格：中灰底 + 「休」字 */
+    .cell-day.vacation {
+      background: #adb5bd !important;
+      color: #2d3436;
+      font-weight: 700;
+      font-size: 13px;
+    }
+
+    /* ── 統計欄（sticky right） ── */
+    .col-stat,
+    .cell-stat {
+      position: sticky;
+      right: 0;
+      z-index: 1;
+      background: #f0f2f5;
+      width: 104px;
+      min-width: 104px;
+      max-width: 104px;
+      padding: 4px 8px;
+      text-align: center;
+      border-left: 2px solid #c5ccd5;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    /* 統計欄標頭（右上角：sticky top + right） */
+    thead .col-stat {
+      z-index: 3;
+      background: #34495e;
+      color: #ecf0f1;
+      font-size: 11px;
+    }
+
+    /* 超過 17 天上班警告（橘色） */
+    .stat-warning {
+      color: #e67e22;
+      font-weight: 700;
+    }
+
+    /* 姓名格超時警告（橘色） */
+    .name-warning { color: #e67e22; }
+
+    /* ── 表尾：每日人力列 ── */
+    tfoot td {
+      border-top: 2px solid #95a5a6;
+    }
+
+    /* 表尾左側姓名欄 */
+    tfoot .cell-name {
+      background: #dfe4ea;
+      font-size: 11px;
+      font-weight: 700;
+      color: #555;
+      text-align: center;
+    }
+
+    /* 表尾右側統計欄 */
+    tfoot .cell-stat {
+      background: #dfe4ea;
+      font-size: 11px;
+      color: #666;
+    }
+
+    /* 每日人力數字格 */
+    .cell-power {
+      font-weight: 700;
+      font-size: 13px;
+      background: #f8f9fa;
+    }
+
+    /* 人力不足（< 9）警告：紅字 + 淡紅底 */
+    .power-warning {
+      color: #e74c3c !important;
+      background: #fdecea !important;
+    }
+
+    /* 機動人員姓名：斜體藍字，與常規人員區分 */
+    .flex-staff {
+      color: #2471a3;
+      font-style: italic;
+    }
+
+    /* tbody 列底線分隔 */
+    tbody tr { border-bottom: 1px solid #ecf0f1; }
+    tbody tr:last-child { border-bottom: 2px solid #bdc3c7; }
+
+    /* 整列 hover 時輕微高亮姓名格 */
+    tbody tr:hover .cell-name { background: #e2e7ed; }
+  </style>
+</head>
+<body>
+
+  <!-- 頂部控制列 -->
+  <div id="controls">
+    <h1>獸醫院排班系統</h1>
+    <div class="divider"></div>
+    <label>
+      年份
+      <select id="sel-year"></select>
+    </label>
+    <label>
+      月份
+      <select id="sel-month"></select>
+    </label>
+    <div class="divider"></div>
+    <button id="btn-clear">清空所有休假</button>
+    <span id="current-label"></span>
+  </div>
+
+  <!-- 排班表格容器（雙向捲動） -->
+  <div id="table-wrapper">
+    <table id="schedule-table">
+      <thead id="schedule-thead"></thead>
+      <tbody id="schedule-tbody"></tbody>
+      <tfoot id="schedule-tfoot"></tfoot>
+    </table>
+  </div>
+
+  <!--
+    ES Module 載入：必須透過 HTTP 伺服器（不可 file://）。
+    詳見頁面頂部的開啟說明。
+  -->
+  <script type="module" src="ui.js"></script>
+</body>
+</html>
