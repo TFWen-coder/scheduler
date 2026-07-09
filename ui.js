@@ -138,17 +138,16 @@ function scheduleMapToSchedule() {
 
 /** 從 scheduleMap 建立 validateHardRules 所需的 dayMap */
 function buildDayMapFromCurrent(y, m) {
+  // 必須回傳 Map<number, Map<string, string[]>>，validateHardRules 依賴 Map API
   const total = daysInMonth(y, m);
-  const dayMap = {};
+  const dayMap = new Map();
   for (let d = 1; d <= total; d++) {
-    dayMap[d] = { counter: [], pharmacy: [], catClinic: [] };
+    dayMap.set(d, new Map([['counter', []], ['pharmacy', []], ['catClinic', []]]));
   }
   for (const [name, dayAssign] of Object.entries(scheduleMap)) {
     for (const [dayStr, pos] of Object.entries(dayAssign)) {
       const d = Number(dayStr);
-      if (dayMap[d] && dayMap[d][pos]) {
-        dayMap[d][pos].push(name);
-      }
+      dayMap.get(d)?.get(pos)?.push(name);
     }
   }
   return dayMap;

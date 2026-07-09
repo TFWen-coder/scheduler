@@ -1,10 +1,16 @@
 /**
  * @file scheduler.js — 獸醫院排班演算法
- * Phase 3a：純函數演算法，不含 UI 操作、不存 localStorage
+ * Phase 3b：修正版純函數演算法，不含 UI 操作、不存 localStorage
  *
  * 兩階段策略：
- *   階段 1 — 逐日貪婪建構（catClinic→pharmacy→counter，MRV 優先）
- *   階段 2 — Hill Climbing 軟規則優化（隨機對換 + 得分比較）
+ *   階段 1 — 逐日貪婪建構（catClinic→pharmacy→counter，配速 + 連班段建構）
+ *     - 建構期即強制 [H5]：連班 ≤3、連班後休 ≥2、不產生「上一休一」鋸齒
+ *     - 訓練者安插受可用性／工時／連班檢查約束（修正訓練者爆班問題）
+ *     - 分層放寬（strict → relaxed → exception）處理人力不足
+ *   階段 1.5 — 補位掃描（canInsertDay 前後雙向檢查，不破壞 H5）
+ *   階段 2 — Hill Climbing 軟規則優化
+ *     - 評分納入硬規則懲罰（-300/條），不會為了軟規則破壞硬規則
+ *     - 新增「同日跨位置對換」移動（零 H5 風險，專攻軟規則）
  */
 
 import {
@@ -53,6 +59,9 @@ import {
 const staffByName = new Map(staff.map(p => [p.name, p]));
 
 const POSITIONS = /** @type {const} */ (['counter', 'pharmacy', 'catClinic']);
+
+// 填位順序：最受限位置優先
+const FILL_ORDER = /** @type {const} */ (['catClinic', 'pharmacy', 'counter']);
 
 // ─── 日期工具 ────────────────────────────────────────────────────────────────
 
@@ -118,14 +127,53 @@ function computeAvailableDays(y, m, vacations) {
   return result;
 }
 
+/**
+ * 計算各人員本月「目標排班天數」（配速用，非硬限制）
+ * 先扣除機動可貢獻人力，再依可排天數上限對常規人員做 waterfill 均分。
+ * @param {number} y
+ * @param {number} m
+ * @param {Map<string, Set<number>>} availMap
+ * @param {Map<string, number>} maxWorkdays
+ * @returns {Map<string, number>}
+ */
+function computeTargets(y, m, availMap, maxWorkdays) {
+  const total = daysInMonth(y, m);
+  const dailyNeed = POSITIONS.reduce((s, p) => s + positionRequirements[p].dailyStaff, 0);
+  let remaining = dailyNeed * total;
+  const targets = new Map();
+
+  // 機動先扣（每可排日貢獻 countsAs 人力）
+  for (const p of staff) {
+    if (p.role !== 'flex') continue;
+    const days = availMap.get(p.name)?.size ?? 0;
+    targets.set(p.name, days);
+    remaining -= days * p.countsAs;
+  }
+
+  // 常規人員 waterfill
+  const regs = staff
+    .filter(p => p.role === 'regular')
+    .map(p => ({
+      name: p.name,
+      cap: Math.min(maxWorkdays.get(p.name) ?? 17, availMap.get(p.name)?.size ?? 0),
+    }))
+    .sort((a, b) => a.cap - b.cap);
+
+  let left = regs.length;
+  for (const r of regs) {
+    const share = Math.ceil(Math.max(0, remaining) / Math.max(1, left));
+    const t = Math.max(1, Math.min(r.cap, share));
+    targets.set(r.name, t);
+    remaining -= t;
+    left--;
+  }
+  return targets;
+}
+
 // ─── 連班工具 ─────────────────────────────────────────────────────────────────
 
 /**
  * 計算某人截至 day（含）的當前連班長度
- * @param {string} name
- * @param {number} day
- * @param {Map<number, Map<string, string[]>>} dayMap
- * @returns {number}
  */
 function currentStreak(name, day, dayMap) {
   let len = 0;
@@ -147,8 +195,6 @@ function isWorking(name, d, dayMap) {
 
 /**
  * 判斷某人員在某星期是否「結構性不可排」（非真休息，不計入連班鋸齒）
- * - weekendOnly 人員的非週末日
- * - forbiddenWeekdays 命中的日期（含外單位日，如俊傑週二、週五）
  * @param {import('./data.js').StaffMember} person
  * @param {number} weekday  0=Sun … 6=Sat
  * @returns {boolean}
@@ -157,6 +203,113 @@ function isUnavailable(person, weekday) {
   if (person.workableDays === 'weekendOnly' && weekday !== 0 && weekday !== 6) return true;
   if (person.forbiddenWeekdays.includes(weekday)) return true;
   return false;
+}
+
+// ─── H5 資格分層 ──────────────────────────────────────────────────────────────
+
+const ELIG_NONE      = 0; // 不可排
+const ELIG_STRICT    = 1; // 完全符合 H5
+const ELIG_RELAXED   = 2; // 前段僅 1 天班、休 1 天（validator 合法，備援用）
+const ELIG_EXCEPTION = 3; // 連 4 天例外（每月一次，人力不足時）
+
+/**
+ * 判斷某人第 d 天的 H5 排班資格（僅往回看，供逐日貪婪使用）
+ * @returns {{ tier:number, continuing:boolean, streak:number }}
+ */
+function h5Eligibility(p, d, dayMap, y, m, consec) {
+  if (p.role !== 'regular') return { tier: ELIG_STRICT, continuing: false, streak: 0 };
+
+  const maxC    = monthlyConstraints.consecutive.maxDays;
+  const maxE    = monthlyConstraints.consecutive.exceptionalMaxDays;
+  const minRest = monthlyConstraints.consecutive.minRestAfter;
+
+  const streak = currentStreak(p.name, d - 1, dayMap);
+  if (streak > 0) {
+    // 延續連班段
+    if (streak < maxC) return { tier: ELIG_STRICT, continuing: true, streak };
+    if (streak < maxE && !consec.usedException) return { tier: ELIG_EXCEPTION, continuing: true, streak };
+    return { tier: ELIG_NONE, continuing: false, streak };
+  }
+
+  // 起始新連班段：找最近的工作日
+  let last = 0;
+  for (let dd = d - 1; dd >= 1; dd--) {
+    if (isWorking(p.name, dd, dayMap)) { last = dd; break; }
+  }
+  if (last === 0) return { tier: ELIG_STRICT, continuing: false, streak: 0 }; // 月初尚未上班
+
+  // 真休息天數（跳過結構性不可排日；休假日計入真休息，與 validator 一致）
+  let trueRest = 0;
+  for (let dd = last + 1; dd < d; dd++) {
+    if (!isUnavailable(p, weekdayOf(y, m, dd))) trueRest++;
+  }
+  // 前段長度
+  let segLen = 0;
+  for (let dd = last; dd >= 1 && isWorking(p.name, dd, dayMap); dd--) segLen++;
+
+  if (trueRest === 0 || trueRest >= minRest) return { tier: ELIG_STRICT, continuing: false, streak: 0 };
+  // 前段僅 1 天班：validator 不要求休 2 天，備援放寬
+  if (segLen === 1 && trueRest >= 1) return { tier: ELIG_RELAXED, continuing: false, streak: 0 };
+  return { tier: ELIG_NONE, continuing: false, streak: 0 };
+}
+
+/**
+ * 判斷把某人「插入」第 d 天是否不破壞 H5（前後雙向檢查，供補位掃描使用）
+ * @returns {{ ok:boolean, exception:boolean }}
+ */
+function canInsertDay(p, d, dayMap, y, m, consec) {
+  if (p.role !== 'regular') return { ok: true, exception: false };
+
+  const total   = daysInMonth(y, m);
+  const maxC    = monthlyConstraints.consecutive.maxDays;
+  const maxE    = monthlyConstraints.consecutive.exceptionalMaxDays;
+  const minRest = monthlyConstraints.consecutive.minRestAfter;
+
+  // 合併後的連班段
+  let back = 0;
+  for (let dd = d - 1; dd >= 1 && isWorking(p.name, dd, dayMap); dd--) back++;
+  let fwd = 0;
+  for (let dd = d + 1; dd <= total && isWorking(p.name, dd, dayMap); dd++) fwd++;
+  const segLen = back + 1 + fwd;
+
+  let exception = false;
+  if (segLen > maxC) {
+    if (segLen <= maxE && !consec.usedException) exception = true;
+    else return { ok: false, exception: false };
+  }
+
+  const start = d - back;
+  const end   = d + fwd;
+
+  // 往前檢查：前一段（若 ≥2 天）之後的真休息是否足夠
+  let prevLast = 0;
+  for (let dd = start - 1; dd >= 1; dd--) {
+    if (isWorking(p.name, dd, dayMap)) { prevLast = dd; break; }
+  }
+  if (prevLast > 0) {
+    let trueRest = 0;
+    for (let dd = prevLast + 1; dd < start; dd++) {
+      if (!isUnavailable(p, weekdayOf(y, m, dd))) trueRest++;
+    }
+    let prevLen = 0;
+    for (let dd = prevLast; dd >= 1 && isWorking(p.name, dd, dayMap); dd--) prevLen++;
+    if (prevLen >= 2 && trueRest > 0 && trueRest < minRest) return { ok: false, exception: false };
+  }
+
+  // 往後檢查：合併段（若 ≥2 天）之後的真休息是否足夠
+  let nextFirst = 0;
+  for (let dd = end + 1; dd <= total; dd++) {
+    if (isWorking(p.name, dd, dayMap)) { nextFirst = dd; break; }
+  }
+  if (nextFirst > 0 && segLen >= 2) {
+    let trueRest = 0;
+    for (let dd = end + 1; dd < nextFirst; dd++) {
+      if (!isUnavailable(p, weekdayOf(y, m, dd))) trueRest++;
+    }
+    if (trueRest > 0 && trueRest < minRest) return { ok: false, exception: false };
+  }
+
+  return { ok: true, exception };
 }
 
 // ─── 硬規則：整月驗證 ─────────────────────────────────────────────────────────
@@ -237,7 +390,7 @@ function validateHardRules(dayMap, y, m, maxWorkdays) {
   for (const p of staff) {
     if (p.role !== 'regular') continue;
 
-    // 找出所有連班段（isUnavailable 日視為分段點，但不計為真休息）
+    // 找出所有連班段
     const segments = [];
     let segStart = -1;
     for (let d = 1; d <= total + 1; d++) {
@@ -266,7 +419,6 @@ function validateHardRules(dayMap, y, m, maxWorkdays) {
       }
 
       // 連班 ≥2 天結束後須有 minRest 天真休息
-      // 段間若全為禁排日（trueRest=0），不計違反：禁排日本身構成自然隔離
       if (seg.length >= 2 && i + 1 < segments.length) {
         const gapStart = seg.end + 1;
         const gapEnd   = segments[i + 1].start - 1;
@@ -284,8 +436,7 @@ function validateHardRules(dayMap, y, m, maxWorkdays) {
       }
     }
 
-    // 「上一休一」鋸齒模式偵測：跳過 isUnavailable 日，
-    // 只在「真可排日」序列中偵測工作/休息交替達 5 次以上
+    // 「上一休一」鋸齒模式偵測
     const realDays = [];
     for (let d = 1; d <= total; d++) {
       const wd = weekdayOf(y, m, d);
@@ -503,13 +654,13 @@ function scoreSoftRules(dayMap, y, m) {
     if (prefDays >= avg + p.preferredExtraDays.extraDays[0]) score += 2;
   }
 
-  // [S1] 位置分配偏離（-1/天偏離）
+  // [S1] 位置分配偏離（-0.5/天偏離；權重低於 S2/S5/S6，避免互相打架）
   for (const p of staff) {
     if (p.positions.length < 2) continue;
     const rec = posDays.get(p.name);
     const counts = p.positions.map(pos => rec?.[pos] ?? 0);
     const avg = counts.reduce((a, b) => a + b, 0) / counts.length;
-    score -= counts.reduce((sum, c) => sum + Math.abs(c - avg), 0);
+    score -= counts.reduce((sum, c) => sum + Math.abs(c - avg), 0) * 0.5;
   }
 
   return { score, violations };
@@ -518,127 +669,225 @@ function scoreSoftRules(dayMap, y, m) {
 // ─── 階段 1：逐日貪婪分配 ────────────────────────────────────────────────────
 
 /**
- * 嘗試填入指定位置至所需人力數（含訓練者優先安插邏輯）
- * @param {string} position
- * @param {number} need        所需人力（機動 countsAs:2 折算）
- * @param {import('./data.js').StaffMember[]} candidates
- * @param {Map<string, string[]>} assigned   當天各位置已排人員
- * @param {Set<string>} usedNames
- * @returns {boolean}          true 表示人力需求已滿足
+ * 檢查候選人加入某位置是否觸發 avoidWith 迴避 [S2]
  */
-function fillPosition(position, need, candidates, assigned, usedNames, workCount, avgWorkdays) {
-  const posArr = assigned.get(position) ?? [];
-
-  // 計算剩餘所需人力
-  let remaining = need;
-  for (const name of posArr) {
-    remaining -= staffByName.get(name)?.countsAs ?? 1;
-  }
-  if (remaining <= 0) return true;
-
-  // 候選人排序：
-  //   1. 超過進度者後排（降格，非排除）
-  //   2. 累計班數少者優先（公平分配）
-  //   3. catClinic 且尚無有照者 → 有照者優先
-  //   4. countsAs 大優先（機動頂兩名）
-  //   5. positions 少優先（受限多，MRV）
-  //   6. 需訓練者優先安插
-  const sorted = [...candidates]
-    .filter(p => !usedNames.has(p.name))
-    .sort((a, b) => {
-      const aCount = workCount?.get(a.name) ?? 0;
-      const bCount = workCount?.get(b.name) ?? 0;
-      const threshold = (avgWorkdays ?? 0) + 2;
-      const aOver = aCount > threshold ? 1 : 0;
-      const bOver = bCount > threshold ? 1 : 0;
-      if (aOver !== bOver) return aOver - bOver;
-      if (aCount !== bCount) return aCount - bCount;
-      if (position === 'catClinic' && !posArr.some(n => staffByName.get(n)?.hasLicense)) {
-        const aLic = a.hasLicense ? 0 : 1;
-        const bLic = b.hasLicense ? 0 : 1;
-        if (aLic !== bLic) return aLic - bLic;
-      }
-      if (a.countsAs !== b.countsAs) return b.countsAs - a.countsAs;
-      if (a.positions.length !== b.positions.length) return a.positions.length - b.positions.length;
-      const aN = (a.needsTraining?.length ?? 0) > 0 ? 1 : 0;
-      const bN = (b.needsTraining?.length ?? 0) > 0 ? 1 : 0;
-      return bN - aN;
-    });
-
-  for (const p of sorted) {
-    if (remaining <= 0) break;
-    if (usedNames.has(p.name)) continue;
-
-    // [H3] 若此人需訓練，先安插訓練者
-    if (p.needsTraining) {
-      const req = p.needsTraining.find(r => r.position === position);
-      if (req) {
-        const currentInPos = assigned.get(position) ?? [];
-        const trainerPresent = req.trainers.some(t => currentInPos.includes(t));
-        if (!trainerPresent) {
-          const trainer = req.trainers.find(t => {
-            if (usedNames.has(t)) return false;
-            return staffByName.get(t)?.positions.includes(position) ?? false;
-          });
-          if (!trainer) continue; // 無可用訓練者，跳過此人
-          const tp = staffByName.get(trainer);
-          if (tp) {
-            posArr.push(trainer);
-            usedNames.add(trainer);
-            remaining -= tp.countsAs ?? 1;
-          }
-        }
-      }
+function avoidConflict(p, position, onDuty) {
+  for (const entry of p.avoidWith) {
+    if (typeof entry === 'string') {
+      if (onDuty.has(entry)) return true;
+    } else if (entry.position === position && onDuty.get(entry.person) === position) {
+      return true;
     }
-
-    posArr.push(p.name);
-    usedNames.add(p.name);
-    remaining -= p.countsAs ?? 1;
   }
-
-  // [H2] catClinic 需有照
-  if (position === 'catClinic' && posArr.length > 0) {
-    if (!posArr.some(n => staffByName.get(n)?.hasLicense)) return false;
-  }
-
-  return remaining <= 0;
+  return false;
 }
 
 /**
- * 為單日產生排班方案，回傳 Map<position, names[]> 或 null（無法滿足硬規則）
- * @param {number} d
- * @param {Map<string, Set<number>>} availMap
- * @param {Map<number, Map<string, string[]>>} dayMap
- * @param {Map<string, number>} workCount
- * @param {Map<string, number>} maxWorkdays
- * @param {{ usedException: boolean }} consec
- * @param {number} y
- * @param {number} m
- * @returns {Map<string, string[]> | null}
+ * 檢查候選人是否觸發 softAvoidPairs（怡庭&燕姐儘量錯開）[S2]
  */
-function assignDay(d, availMap, dayMap, workCount, maxWorkdays, consec, y, m, lockedSet = null) {
-  // 當天可用人員（未超工時上限 + 連班未超限 + 非預填鎖定）
-  const canWork = staff.filter(p => {
-    if (lockedSet?.has(`${p.name}|${d}`)) return false;
-    if (!availMap.get(p.name)?.has(d)) return false;
-    if ((workCount.get(p.name) ?? 0) >= (maxWorkdays.get(p.name) ?? 17)) return false;
-    if (p.role !== 'regular') return true;
-    const streak = currentStreak(p.name, d - 1, dayMap);
-    const maxC = monthlyConstraints.consecutive.maxDays;
-    const maxE = monthlyConstraints.consecutive.exceptionalMaxDays;
-    if (streak < maxC) return true;
-    if (streak < maxE && !consec.usedException) return true;
-    return false;
-  });
+function softAvoidHit(p, onDuty) {
+  for (const pair of monthlyConstraints.softAvoidPairs) {
+    const [a, b] = pair.pair;
+    if (p.name === a && onDuty.has(b)) return true;
+    if (p.name === b && onDuty.has(a)) return true;
+  }
+  return false;
+}
 
-  // 分組至各位置候選
-  const byPos = {
-    counter:   canWork.filter(p => p.positions.includes('counter')),
-    pharmacy:  canWork.filter(p => p.positions.includes('pharmacy')),
-    catClinic: canWork.filter(p => p.positions.includes('catClinic')),
+/**
+ * 檢查候選人是否使小加&小柚重疊超過上限 [S4]
+ */
+function s4Blocked(p, onDuty, ctx) {
+  const [a, b] = monthlyConstraints.xiaojiaXiaoyouOverlap.staff;
+  const other = p.name === a ? b : p.name === b ? a : null;
+  if (!other) return false;
+  if (!onDuty.has(other)) return false;
+  return ctx.overlapUsed >= monthlyConstraints.xiaojiaXiaoyouOverlap.maxDays;
+}
+
+/**
+ * 候選人排序 key（越小越優先）
+ */
+function candKey(c, position, posArr, ctx, counterLeft = Infinity) {
+  const p = c.p;
+  const target = Math.max(1, ctx.targets.get(p.name) ?? 17);
+  let key = (ctx.workCount.get(p.name) ?? 0) / target; // 配速：落後者優先
+
+  // counter 稀缺度保護：counter 只能由 13 人擔任且填位順序最後，
+  // 當天 counter 可用人選所剩無幾時，catClinic/pharmacy 不應搶走他們
+  if (position !== 'counter' && p.positions.includes('counter')) {
+    const need = positionRequirements.counter.dailyStaff; // 3
+    if (counterLeft <= need) key += 2.5;
+    else if (counterLeft === need + 1) key += 0.8;
+    else if (counterLeft === need + 2) key += 0.25;
+  }
+
+  // 連班段建構：延續中的段優先完成（2-3 天一段，避免 1 天孤段與鋸齒）
+  if (c.elig.continuing) key -= c.elig.streak === 1 ? 0.55 : 0.3;
+
+  // 機動：人力 ×2，週末優先用好用滿。
+  // 優先填 pharmacy（一人吃滿 2 人力），把 catClinic 的 4 個位置
+  // 留給小加/小柚與其訓練者，避免週末學員被擠出
+  if (p.role === 'flex') key -= position === 'pharmacy' ? 3.5 : 0.5;
+
+  // [H2] catClinic 尚無有照者 → 有照者大幅優先
+  if (position === 'catClinic' && p.hasLicense &&
+      !posArr.some(n => staffByName.get(n)?.hasLicense)) {
+    key -= 1.5;
+  }
+
+  // [S5] 仕賢/彤彤 catClinic 未達 10 天 → 優先
+  if (position === 'catClinic' &&
+      monthlyConstraints.catClinicManagement.staff.includes(p.name) &&
+      (ctx.catDays.get(p.name) ?? 0) < monthlyConstraints.catClinicManagement.minDaysEach) {
+    key -= 0.5;
+  }
+
+  // [S3] 管理職偏好位置
+  if (p.preferredExtraDays?.position === position) key -= 0.15;
+
+  // [S6] 雅卉偏好 catClinic
+  if (p.name === '雅卉') key += position === 'catClinic' ? -0.2 : 0.45;
+
+  // MRV：可排位置少者優先（怡庭/燕姐/小加/小柚/莉婷/俊傑）
+  key -= (3 - p.positions.length) * 0.3;
+
+  // 需訓練者略後（等訓練者先就位，可省一次強制安插）
+  if (p.needsTraining?.some(r => r.position === position)) key += 0.1;
+
+  // 多重啟隨機擾動（第 2 次以後的重啟）
+  if (ctx.jitter) key += (Math.random() - 0.5) * ctx.jitter;
+
+  return key;
+}
+
+/**
+ * 嘗試填入指定位置至所需人力數（分層放寬 + 訓練配對 + 迴避配對）
+ *
+ * pass 1：ELIG_STRICT，尊重 avoidWith / softAvoidPairs / S4，
+ *         被訓練者僅在訓練者已就位時進場
+ * pass 2：ELIG_STRICT，放棄軟性迴避，可主動安插訓練者（訓練者亦須合格）
+ * pass 3：加入 ELIG_RELAXED（前段 1 天班休 1 天，validator 合法）
+ * pass 4：加入 ELIG_EXCEPTION（連 4 例外，每月一次 → 即 [H5] 人力不足例外）
+ */
+function fillPosition(position, need, cands, assigned, usedNames, ctx) {
+  const posArr = assigned.get(position);
+  let remaining = need - posArr.reduce((s, n) => s + (staffByName.get(n)?.countsAs ?? 1), 0);
+  if (remaining <= 0) return;
+
+  const buildOnDuty = () => {
+    const onDuty = new Map();
+    for (const [pos, names] of assigned) {
+      for (const n of names) onDuty.set(n, pos);
+    }
+    return onDuty;
   };
 
-  // 初始化時保留預填人員（已寫入 dayMap），避免 fillPosition 重複計算
+  for (let pass = 1; pass <= 4 && remaining > 0; pass++) {
+    // 有人加入後重新掃描整個候選池：
+    // 被訓練者（小加/小柚/莉婷）在訓練者就位前會被跳過，
+    // 訓練者加入後必須回頭再給他們機會，否則會被永久擠出當日班表。
+    let progressed = true;
+    while (progressed && remaining > 0) {
+      progressed = false;
+
+      // counter 稀缺度：當天尚未用掉、可排 counter 的候選人數
+      const counterLeft = cands.filter(c =>
+        !usedNames.has(c.p.name) && c.p.positions.includes('counter')
+      ).length;
+
+      const pool = cands
+        .filter(c => {
+          if (usedNames.has(c.p.name)) return false;
+          if (!c.p.positions.includes(position)) return false;
+          const t = c.elig.tier;
+          if (pass <= 2) return t === ELIG_STRICT;
+          if (pass === 3) return t === ELIG_STRICT || t === ELIG_RELAXED;
+          return t !== ELIG_NONE;
+        })
+        .sort((a, b) =>
+          candKey(a, position, posArr, ctx, counterLeft) -
+          candKey(b, position, posArr, ctx, counterLeft));
+
+      for (const c of pool) {
+        if (remaining <= 0) break;
+        const p = c.p;
+        if (usedNames.has(p.name)) continue;
+
+        // 避免超編：countsAs 2 塞進剩 1 人力的缺口（有其他人選時先跳過）
+        if (p.countsAs > remaining &&
+            pool.some(o => o !== c && !usedNames.has(o.p.name) && o.p.countsAs <= remaining)) {
+          continue;
+        }
+
+        const onDuty = buildOnDuty();
+
+        // [S4] 小加&小柚重疊上限：pass 1-3 都擋，只有 pass 4 放行
+        if (pass <= 3 && s4Blocked(p, onDuty, ctx)) continue;
+
+        if (pass === 1) {
+          // [S2] 迴避配對與軟性錯開：第一輪完全尊重
+          if (avoidConflict(p, position, onDuty)) continue;
+          if (softAvoidHit(p, onDuty)) continue;
+        }
+
+        // [H3] 訓練配對：訓練者不在位時，嘗試主動帶訓練者一起進場
+        // （訓練者本身也必須通過相同資格檢查，修正爆班 bug）
+        if (p.needsTraining) {
+          const req = p.needsTraining.find(r => r.position === position);
+          if (req) {
+            const trainerPresent = req.trainers.some(t => posArr.includes(t));
+            if (!trainerPresent) {
+              const tCand = pool.find(c2 =>
+                c2 !== c &&
+                req.trainers.includes(c2.p.name) &&
+                !usedNames.has(c2.p.name) &&
+                c2.p.positions.includes(position) &&
+                c2.elig.tier === ELIG_STRICT &&
+                (pass > 1 || (!avoidConflict(c2.p, position, onDuty) && !softAvoidHit(c2.p, onDuty)))
+              );
+              if (!tCand) continue;
+              if (remaining < p.countsAs + tCand.p.countsAs) continue;
+              posArr.push(tCand.p.name);
+              usedNames.add(tCand.p.name);
+              remaining -= tCand.p.countsAs;
+            }
+          }
+        }
+
+        posArr.push(p.name);
+        usedNames.add(p.name);
+        remaining -= p.countsAs;
+        progressed = true;
+
+        if (c.elig.tier === ELIG_EXCEPTION) ctx.consec.usedException = true;
+
+        // 每次成功加入後跳出重掃：讓「因缺訓練者被跳過」的高優先候選
+        // 在訓練者就位後能立刻被重新考慮，並依最新狀態重新排序
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * 為單日產生排班方案
+ * @returns {Map<string, string[]>}
+ */
+function assignDay(d, availMap, dayMap, maxWorkdays, ctx, y, m, lockedSet = null) {
+  // 建立當日候選（含 H5 資格分層）
+  const cands = [];
+  for (const p of staff) {
+    if (lockedSet?.has(`${p.name}|${d}`)) continue;
+    if (!availMap.get(p.name)?.has(d)) continue;
+    if (p.role === 'regular' &&
+        (ctx.workCount.get(p.name) ?? 0) >= (maxWorkdays.get(p.name) ?? 17)) continue;
+    const elig = h5Eligibility(p, d, dayMap, y, m, ctx.consec);
+    if (elig.tier === ELIG_NONE) continue;
+    cands.push({ p, elig });
+  }
+
+  // 初始化：保留預填人員
   const existingPosMap = dayMap.get(d);
   const assigned = new Map([
     ['counter',   [...(existingPosMap?.get('counter')   ?? [])]],
@@ -650,25 +899,9 @@ function assignDay(d, availMap, dayMap, workCount, maxWorkdays, consec, y, m, lo
     for (const n of names) usedNames.add(n);
   }
 
-  const total_ = daysInMonth(y, m);
-  const avgWorkdays = Math.max(1, (d / total_) * 17);
-
   // 填入順序：catClinic（最受限）→ pharmacy → counter
-  const catOk  = fillPosition('catClinic', positionRequirements.catClinic.dailyStaff, byPos.catClinic, assigned, usedNames, workCount, avgWorkdays);
-  const pharOk = fillPosition('pharmacy',  positionRequirements.pharmacy.dailyStaff,  byPos.pharmacy,  assigned, usedNames, workCount, avgWorkdays);
-  const cntOk  = fillPosition('counter',   positionRequirements.counter.dailyStaff,   byPos.counter,   assigned, usedNames, workCount, avgWorkdays);
-
-  // 標記連班例外使用
-  if (!consec.usedException) {
-    for (const p of canWork) {
-      if (p.role !== 'regular') continue;
-      const streak = currentStreak(p.name, d - 1, dayMap);
-      if (streak >= monthlyConstraints.consecutive.maxDays) {
-        let assigned_ = false;
-        for (const names of assigned.values()) { if (names.includes(p.name)) { assigned_ = true; break; } }
-        if (assigned_) { consec.usedException = true; break; }
-      }
-    }
+  for (const pos of FILL_ORDER) {
+    fillPosition(pos, positionRequirements[pos].dailyStaff, cands, assigned, usedNames, ctx);
   }
 
   // 即使人力不足也回傳部分解（unfilled 由後續 computeUnfilled 記錄）
@@ -678,31 +911,28 @@ function assignDay(d, availMap, dayMap, workCount, maxWorkdays, consec, y, m, lo
 // ─── 階段 2：Hill Climbing ────────────────────────────────────────────────────
 
 /**
- * 綜合評分 = 軟規則分數 − 人力缺口懲罰（每缺 1 人力扣 20 分）
- * Hill Climbing 用此分數同時優化軟規則與填補人力缺口。
- * @param {Map<number, Map<string, string[]>>} dayMap
- * @param {number} y
- * @param {number} m
- * @returns {number}
+ * 綜合評分 = 軟規則分數 − 硬規則懲罰（-300/條）− 人力缺口懲罰（-40/人力）
+ * 硬規則納入評分後，hill climbing 不會為了軟規則破壞硬規則，
+ * 且可主動修復殘餘硬違反。
  */
-function computeScore(dayMap, y, m) {
+function computeScore(dayMap, y, m, maxWorkdays) {
   const { score } = scoreSoftRules(dayMap, y, m);
   const unfilled = computeUnfilled(dayMap, y, m);
-  return score - unfilled.reduce((sum, u) => sum + u.shortBy * 20, 0);
+  const hard = validateHardRules(dayMap, y, m, maxWorkdays);
+  return score
+    - hard.length * 300
+    - unfilled.reduce((sum, u) => sum + u.shortBy * 40, 0);
 }
 
 /**
- * 執行一輪 hill climbing：120 次嘗試，含「針對缺口日的 shift 移動」與「隨機對換」。
- * @param {Map<number, Map<string, string[]>>} dayMap
- * @param {number} total
- * @param {number} y
- * @param {number} m
- * @param {Map<string, Set<number>>} availMap
- * @param {Map<string, number>} maxWorkdays
+ * 執行一輪 hill climbing：100 次嘗試，含三種移動：
+ *   shift   — 把某日某位置的人移至缺口日同位置（填缺口）
+ *   swap    — 兩日同位置一人對換（調整工作日分布）
+ *   dayswap — 同日跨位置對換（不動任何人的工作日，零 H5 風險，專攻軟規則）
  * @returns {boolean} 是否有改善
  */
 function hillClimbStep(dayMap, total, y, m, availMap, maxWorkdays, lockedSet = null) {
-  const baseScore = computeScore(dayMap, y, m);
+  const baseScore = computeScore(dayMap, y, m, maxWorkdays);
   let bestScore = baseScore;
   let bestOp = null;
 
@@ -717,15 +947,47 @@ function hillClimbStep(dayMap, total, y, m, availMap, maxWorkdays, lockedSet = n
     }
   }
 
-  for (let attempt = 0; attempt < 120; attempt++) {
-    const useShift = unfilledSlots.length > 0 && Math.random() < 0.5;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const r = Math.random();
+    const useInsert  = unfilledSlots.length > 0 && r < 0.35;
+    const useShift   = !useInsert && unfilledSlots.length > 0 && r < 0.55;
+    const useDaySwap = !useInsert && !useShift && r < 0.75;
 
-    if (useShift) {
-      // ── Shift 移動：把某日/某位置的人移至缺口日的同位置 ──
+    if (useInsert) {
+      // ── Insert：把「當天沒上班、還有配額」的人直接插入缺口 ──
+      // H5/H8 由 computeScore 的硬規則懲罰把關（變差的插入不會被採納）
       const slot = unfilledSlots[Math.floor(Math.random() * unfilledSlots.length)];
       const { d: d1, pos } = slot;
 
-      // 找有該位置人員的另一天
+      const cand = staff[Math.floor(Math.random() * staff.length)];
+      if (!cand.positions.includes(pos)) continue;
+      if (lockedSet?.has(`${cand.name}|${d1}`)) continue;
+      if (!availMap.get(cand.name)?.has(d1)) continue;
+      if (isWorking(cand.name, d1, dayMap)) continue;
+
+      const arr1 = dayMap.get(d1).get(pos);
+      const prePow1 = {};
+      for (const p of POSITIONS) {
+        prePow1[p] = (dayMap.get(d1)?.get(p) ?? []).reduce((s, n) => s + (staffByName.get(n)?.countsAs ?? 1), 0);
+      }
+
+      arr1.push(cand.name);
+
+      if (isDayValid(d1, dayMap, y, m, prePow1)) {
+        const newScore = computeScore(dayMap, y, m, maxWorkdays);
+        if (newScore > bestScore) {
+          bestScore = newScore;
+          bestOp = { type: 'insert', d1, pos, name: cand.name };
+        }
+      }
+
+      arr1.pop();
+
+    } else if (useShift) {
+      // ── Shift：把某日/某位置的人移至缺口日的同位置 ──
+      const slot = unfilledSlots[Math.floor(Math.random() * unfilledSlots.length)];
+      const { d: d1, pos } = slot;
+
       let d2 = 1 + Math.floor(Math.random() * total);
       let tries = 0;
       while ((d2 === d1 || (dayMap.get(d2)?.get(pos)?.length ?? 0) === 0) && tries++ < 15) {
@@ -740,7 +1002,6 @@ function hillClimbStep(dayMap, total, y, m, availMap, maxWorkdays, lockedSet = n
       if (!availMap.get(n2)?.has(d1)) continue;
       if (isWorking(n2, d1, dayMap)) continue;
 
-      // 記錄移動前各位置人力
       const prePow1 = {}, prePow2 = {};
       for (const p of POSITIONS) {
         prePow1[p] = (dayMap.get(d1)?.get(p) ?? []).reduce((s, n) => s + (staffByName.get(n)?.countsAs ?? 1), 0);
@@ -754,7 +1015,7 @@ function hillClimbStep(dayMap, total, y, m, availMap, maxWorkdays, lockedSet = n
       names2.splice(idx2, 1);
 
       if (isDayValid(d1, dayMap, y, m, prePow1) && isDayValid(d2, dayMap, y, m, prePow2)) {
-        const newScore = computeScore(dayMap, y, m);
+        const newScore = computeScore(dayMap, y, m, maxWorkdays);
         if (newScore > bestScore) {
           bestScore = newScore;
           bestOp = { type: 'shift', d1, d2, pos, n2, idx2 };
@@ -765,8 +1026,46 @@ function hillClimbStep(dayMap, total, y, m, availMap, maxWorkdays, lockedSet = n
       arr1.splice(arr1.lastIndexOf(n2), 1);
       names2.splice(idx2, 0, n2);
 
+    } else if (useDaySwap) {
+      // ── 同日跨位置對換：不改變任何人的工作日，零 H5 風險 ──
+      const d1 = 1 + Math.floor(Math.random() * total);
+      const posMap = dayMap.get(d1);
+      if (!posMap) continue;
+      const posA = POSITIONS[Math.floor(Math.random() * POSITIONS.length)];
+      const posB = POSITIONS[Math.floor(Math.random() * POSITIONS.length)];
+      if (posA === posB) continue;
+      const namesA = posMap.get(posA) ?? [];
+      const namesB = posMap.get(posB) ?? [];
+      if (namesA.length === 0 || namesB.length === 0) continue;
+
+      const n1 = namesA[Math.floor(Math.random() * namesA.length)];
+      const n2 = namesB[Math.floor(Math.random() * namesB.length)];
+      if (lockedSet?.has(`${n1}|${d1}`) || lockedSet?.has(`${n2}|${d1}`)) continue;
+
+      const p1 = staffByName.get(n1);
+      const p2 = staffByName.get(n2);
+      if (!p1?.positions.includes(posB) || !p2?.positions.includes(posA)) continue;
+      // countsAs 不同者不可跨位置換（機動 ×2 會造成人力不平衡）
+      if ((p1.countsAs ?? 1) !== (p2.countsAs ?? 1)) continue;
+
+      const i1 = namesA.indexOf(n1);
+      const i2 = namesB.indexOf(n2);
+      namesA[i1] = n2;
+      namesB[i2] = n1;
+
+      if (isDayValid(d1, dayMap, y, m)) {
+        const newScore = computeScore(dayMap, y, m, maxWorkdays);
+        if (newScore > bestScore) {
+          bestScore = newScore;
+          bestOp = { type: 'dayswap', d1, posA, posB, n1, n2 };
+        }
+      }
+
+      namesA[i1] = n1;
+      namesB[i2] = n2;
+
     } else {
-      // ── 隨機對換（原有邏輯）──
+      // ── 兩日同位置一人對換 ──
       const d1 = 1 + Math.floor(Math.random() * total);
       const d2 = 1 + Math.floor(Math.random() * total);
       if (d1 === d2) continue;
@@ -780,6 +1079,7 @@ function hillClimbStep(dayMap, total, y, m, availMap, maxWorkdays, lockedSet = n
       const n2 = names2[Math.floor(Math.random() * names2.length)];
       if (n1 === n2) continue;
       if (lockedSet?.has(`${n1}|${d1}`) || lockedSet?.has(`${n2}|${d2}`)) continue;
+      if (isWorking(n2, d1, dayMap) || isWorking(n1, d2, dayMap)) continue;
 
       const p1 = staffByName.get(n1);
       const p2 = staffByName.get(n2);
@@ -797,7 +1097,7 @@ function hillClimbStep(dayMap, total, y, m, availMap, maxWorkdays, lockedSet = n
       swapPersons(dayMap, d1, d2, pos, n1, n2);
 
       if (isDayValid(d1, dayMap, y, m, prePow1) && isDayValid(d2, dayMap, y, m, prePow2)) {
-        const newScore = computeScore(dayMap, y, m);
+        const newScore = computeScore(dayMap, y, m, maxWorkdays);
         if (newScore > bestScore) {
           bestScore = newScore;
           bestOp = { type: 'swap', d1, d2, pos, n1, n2 };
@@ -812,6 +1112,14 @@ function hillClimbStep(dayMap, total, y, m, availMap, maxWorkdays, lockedSet = n
     if (bestOp.type === 'swap') {
       const { d1, d2, pos, n1, n2 } = bestOp;
       swapPersons(dayMap, d1, d2, pos, n1, n2);
+    } else if (bestOp.type === 'insert') {
+      dayMap.get(bestOp.d1).get(bestOp.pos).push(bestOp.name);
+    } else if (bestOp.type === 'dayswap') {
+      const { d1, posA, posB, n1, n2 } = bestOp;
+      const namesA = dayMap.get(d1).get(posA);
+      const namesB = dayMap.get(d1).get(posB);
+      namesA[namesA.indexOf(n1)] = n2;
+      namesB[namesB.indexOf(n2)] = n1;
     } else {
       const { d1, d2, pos, n2, idx2 } = bestOp;
       dayMap.get(d1).get(pos).push(n2);
@@ -840,8 +1148,6 @@ function swapPersons(dayMap, d1, d2, pos, n1, n2) {
 
 /**
  * 將 dayMap 轉為 ScheduleResult.schedule 格式
- * @param {Map<number, Map<string, string[]>>} dayMap
- * @returns {Object<string, Assignment[]>}
  */
 function dayMapToSchedule(dayMap) {
   const result = Object.fromEntries(staff.map(p => [p.name, []]));
@@ -858,10 +1164,6 @@ function dayMapToSchedule(dayMap) {
 
 /**
  * 計算每日人力缺口
- * @param {Map<number, Map<string, string[]>>} dayMap
- * @param {number} y
- * @param {number} m
- * @returns {{day:number, position:string, shortBy:number}[]}
  */
 function computeUnfilled(dayMap, y, m) {
   const total = daysInMonth(y, m);
@@ -889,6 +1191,7 @@ function computeUnfilled(dayMap, y, m) {
  * @param {Object}   [options]
  * @param {number}   [options.timeLimitMs=120000]
  * @param {(p: ProgressInfo) => void} [options.onProgress]
+ * @param {Object<string, Object<string, string>>} [prefilled]  {人名: {日期: position|'vacation'}}
  * @returns {ScheduleResult}
  */
 export function generateSchedule(year, month, vacations = {}, options = {}, prefilled = {}) {
@@ -911,149 +1214,147 @@ export function generateSchedule(year, month, vacations = {}, options = {}, pref
   }
 
   const availMap = computeAvailableDays(year, month, vacationsExt);
+  const targets  = computeTargets(year, month, availMap, maxWorkdays);
 
-  // dayMap: Map<day, Map<position, names[]>>
-  const dayMap = new Map();
-  for (let d = 1; d <= total; d++) {
-    dayMap.set(d, new Map([['counter', []], ['pharmacy', []], ['catClinic', []]]));
-  }
-
-  // ── 預填處理：建立 lockedSet，寫入 position 類型到 dayMap ─────────────
+  // ── 預填處理：建立 lockedSet（dayMap 寫入由 buildInitial 處理）──────
   const lockedSet = new Set(); // Set<"name|day">
   for (const [name, dayValues] of Object.entries(prefilled)) {
-    for (const [dayStr, value] of Object.entries(dayValues)) {
-      const day = Number(dayStr);
-      lockedSet.add(`${name}|${day}`);
-      if (value !== 'vacation' && POSITIONS.includes(value)) {
-        const posArr = dayMap.get(day)?.get(value);
-        if (posArr && !posArr.includes(name)) posArr.push(name);
-      }
+    for (const dayStr of Object.keys(dayValues)) {
+      lockedSet.add(`${name}|${Number(dayStr)}`);
     }
   }
 
-  const consec    = { usedException: false };
-  const workCount = new Map(staff.map(p => [p.name, 0]));
-
-  // workCount 初始化：計入預填排班天數
-  for (const [name, dayValues] of Object.entries(prefilled)) {
-    for (const value of Object.values(dayValues)) {
-      if (value !== 'vacation' && POSITIONS.includes(value)) {
-        workCount.set(name, (workCount.get(name) ?? 0) + 1);
-      }
-    }
-  }
-
-  // consec.usedException：若預填排班讓某 regular 人員連班達 maxDays，標記例外已用
-  for (const [name, dayValues] of Object.entries(prefilled)) {
-    const p = staffByName.get(name);
-    if (!p || p.role !== 'regular') continue;
-    for (const [dayStr, value] of Object.entries(dayValues)) {
-      if (value === 'vacation') continue;
-      const day = Number(dayStr);
-      if (currentStreak(name, day - 1, dayMap) >= monthlyConstraints.consecutive.maxDays) {
-        consec.usedException = true;
-      }
-    }
-  }
-
-  // ── 階段 1 ──────────────────────────────────────────────
+  // ── 階段 1：多次隨機重啟，取綜合評分最佳的初始解 ─────────
   onProgress?.({ stage: 'phase1', message: '階段 1：建構初始可行解…', percent: 0 });
   let lastProgressMs = Date.now();
 
-  for (let d = 1; d <= total; d++) {
-    const result = assignDay(d, availMap, dayMap, workCount, maxWorkdays, consec, year, month, lockedSet);
-    if (result) {
-      for (const [pos, names] of result) {
-        dayMap.get(d).set(pos, names);
-        for (const name of names) {
-          if (!lockedSet.has(`${name}|${d}`)) {
-            workCount.set(name, (workCount.get(name) ?? 0) + 1);
-          }
+  const [s4a, s4b] = monthlyConstraints.xiaojiaXiaoyouOverlap.staff;
+
+  const buildInitial = (jitter) => {
+    // 全新 dayMap（含預填）
+    const dm = new Map();
+    for (let d = 1; d <= total; d++) {
+      dm.set(d, new Map([['counter', []], ['pharmacy', []], ['catClinic', []]]));
+    }
+    for (const [name, dayValues] of Object.entries(prefilled)) {
+      for (const [dayStr, value] of Object.entries(dayValues)) {
+        if (value !== 'vacation' && POSITIONS.includes(value)) {
+          const posArr = dm.get(Number(dayStr))?.get(value);
+          if (posArr && !posArr.includes(name)) posArr.push(name);
         }
       }
     }
 
-    const now = Date.now();
-    if (now - lastProgressMs >= 200) {
-      onProgress?.({ stage: 'phase1', message: `階段 1：第 ${d}/${total} 天`, percent: Math.round(d / total * 50) });
-      lastProgressMs = now;
+    const c = {
+      workCount:   new Map(staff.map(p => [p.name, 0])),
+      targets,
+      catDays:     new Map(),
+      overlapUsed: 0,
+      consec:      { usedException: false },
+      jitter,
+    };
+    for (const [name, dayValues] of Object.entries(prefilled)) {
+      for (const value of Object.values(dayValues)) {
+        if (value !== 'vacation' && POSITIONS.includes(value)) {
+          c.workCount.set(name, (c.workCount.get(name) ?? 0) + 1);
+        }
+      }
     }
-  }
 
-  const phase1Overtime = Date.now() - startTime > timeLimitMs * 0.6;
-
-  // ── 階段 1.5：補位掃描（填補 Phase 1 遺留的人力缺口）──────
-  // 逐天逐位置掃描，對仍有缺口的位置補入最少班的可用人員。
-  // 不做完整回溯，H5 rest-after-segment 由 validateHardRules 最終報告。
-  if (!phase1Overtime) {
-    onProgress?.({ stage: 'phase1', message: '階段 1.5：補位掃描中…', percent: 50 });
-
+    // 逐日貪婪
     for (let d = 1; d <= total; d++) {
-      const posMap = dayMap.get(d);
+      const result = assignDay(d, availMap, dm, maxWorkdays, c, year, month, lockedSet);
+      for (const [pos, names] of result) {
+        dm.get(d).set(pos, names);
+        for (const name of names) {
+          if (!lockedSet.has(`${name}|${d}`)) {
+            c.workCount.set(name, (c.workCount.get(name) ?? 0) + 1);
+          }
+        }
+      }
+      const posMap = dm.get(d);
+      const dayNames = new Set();
+      for (const names of posMap.values()) for (const n of names) dayNames.add(n);
+      if (dayNames.has(s4a) && dayNames.has(s4b)) c.overlapUsed++;
+      for (const n of posMap.get('catClinic') ?? []) {
+        if (monthlyConstraints.catClinicManagement.staff.includes(n)) {
+          c.catDays.set(n, (c.catDays.get(n) ?? 0) + 1);
+        }
+      }
+    }
+
+    // 階段 1.5：補位掃描（canInsertDay 雙向檢查，不破壞 H5）
+    for (let d = 1; d <= total; d++) {
+      const posMap = dm.get(d);
 
       for (const pos of POSITIONS) {
         const req = positionRequirements[pos].dailyStaff;
         const names = posMap.get(pos);
-        let power = names.reduce((s, n) => s + (staffByName.get(n)?.countsAs ?? 1), 0);
+        let power = names.reduce((sum, n) => sum + (staffByName.get(n)?.countsAs ?? 1), 0);
         if (power >= req) continue;
 
-        // 今日已排人員（任何位置）
         const alreadyOnDay = new Set();
         for (const ns of posMap.values()) for (const n of ns) alreadyOnDay.add(n);
 
-        // 候選人：可用 + 未超工時 + 可排此位置 + 連班未超限
         const fillers = staff
           .filter(p => {
             if (alreadyOnDay.has(p.name)) return false;
+            if (lockedSet.has(`${p.name}|${d}`)) return false;
             if (!availMap.get(p.name)?.has(d)) return false;
-            if ((workCount.get(p.name) ?? 0) >= (maxWorkdays.get(p.name) ?? 17)) return false;
+            if (p.role === 'regular' &&
+                (c.workCount.get(p.name) ?? 0) >= (maxWorkdays.get(p.name) ?? 17)) return false;
             if (!p.positions.includes(pos)) return false;
-            if (p.role === 'regular') {
-              const streak = currentStreak(p.name, d - 1, dayMap);
-              const maxC = monthlyConstraints.consecutive.maxDays;
-              const maxE = monthlyConstraints.consecutive.exceptionalMaxDays;
-              if (streak >= maxE) return false;
-              if (streak >= maxC && consec.usedException) return false;
-            }
-            return true;
+            return canInsertDay(p, d, dm, year, month, c.consec).ok;
           })
           .sort((a, b) => {
-            // catClinic：尚無有照者時有照候選優先
             if (pos === 'catClinic' && !names.some(n => staffByName.get(n)?.hasLicense)) {
               const aLic = a.hasLicense ? 0 : 1;
               const bLic = b.hasLicense ? 0 : 1;
               if (aLic !== bLic) return aLic - bLic;
             }
-            return (workCount.get(a.name) ?? 0) - (workCount.get(b.name) ?? 0);
+            return (c.workCount.get(a.name) ?? 0) - (c.workCount.get(b.name) ?? 0);
           });
 
         for (const p of fillers) {
           if (power >= req) break;
 
-          // H3：需訓練者須有訓練者在同位置
           if (p.needsTraining) {
             const reqT = p.needsTraining.find(r => r.position === pos);
             if (reqT && !reqT.trainers.some(t => names.includes(t))) continue;
           }
 
-          // H2 安全網：catClinic 已有人但無照時只接受有照者
           if (pos === 'catClinic' && names.length > 0 &&
               !names.some(n => staffByName.get(n)?.hasLicense) && !p.hasLicense) {
             continue;
           }
 
-          names.push(p.name);
-          workCount.set(p.name, (workCount.get(p.name) ?? 0) + 1);
-          power += p.countsAs ?? 1;
+          const ins = canInsertDay(p, d, dm, year, month, c.consec);
+          if (!ins.ok) continue;
+          if (ins.exception) c.consec.usedException = true;
 
-          if (!consec.usedException && p.role === 'regular') {
-            const streak = currentStreak(p.name, d - 1, dayMap);
-            if (streak >= monthlyConstraints.consecutive.maxDays) consec.usedException = true;
-          }
+          names.push(p.name);
+          c.workCount.set(p.name, (c.workCount.get(p.name) ?? 0) + 1);
+          power += p.countsAs ?? 1;
         }
       }
     }
+
+    return dm;
+  };
+
+  // 多次重啟：第 1 次無擾動（確定性），之後加隨機擾動，取最佳
+  let dayMap = null;
+  let bestInitScore = -Infinity;
+  const MAX_RESTARTS = 6;
+  for (let rIdx = 0; rIdx < MAX_RESTARTS; rIdx++) {
+    if (dayMap && Date.now() - startTime > timeLimitMs * 0.35) break;
+    const dm = buildInitial(rIdx === 0 ? 0 : 0.3);
+    const sc = computeScore(dm, year, month, maxWorkdays);
+    if (sc > bestInitScore) { bestInitScore = sc; dayMap = dm; }
+    onProgress?.({ stage: 'phase1', message: `階段 1：初始解 ${rIdx + 1}/${MAX_RESTARTS}`, percent: Math.round((rIdx + 1) / MAX_RESTARTS * 50) });
   }
+
+  const phase1Overtime = Date.now() - startTime > timeLimitMs * 0.6;
 
   if (phase1Overtime) {
     onProgress?.({ stage: 'phase1', message: '階段 1 超時，跳過優化階段', percent: 90 });
@@ -1109,46 +1410,5 @@ export function generateSchedule(year, month, vacations = {}, options = {}, pref
 
   return { schedule, hardViolations, softViolations, unfilled, workdayCount, summary };
 }
-
-/*
- * ════════════════════════════════════════════════════════════════
- *  演算法說明
- * ════════════════════════════════════════════════════════════════
- *
- *  主要策略：
- *    階段 1 — 逐日貪婪建構
- *      按日期順序逐天分配人員。每天的填入順序為：
- *        catClinic（限制最多：需有照 + 訓練配對 + 機動只限週末）
- *        pharmacy（需訓練配對：莉婷需有雅卉或樂樂）
- *        counter（最寬鬆）
- *      候選人排序（MRV 概念）：
- *        countsAs 大 > positions 選項少 > 需訓練者優先
- *      [H3] 訓練配對安插：被訓練者被選中前，先嘗試將訓練者插入同位置。
- *      [H5] 連班：超限者直接排除在候選外，例外（第 4 天）每月限用一次。
- *
- *    階段 2 — Hill Climbing
- *      每輪隨機嘗試 60 次「兩日同位置一人對換」。
- *      換前後均驗證單日硬規則，換後若軟規則得分提升則保留。
- *      連續 40 輪無改善或超過 90% 時間上限時停止。
- *
- *  已知限制：
- *    1. 貪婪階段不做跨日回溯，月底可能因人員配額耗盡產生人力缺口。
- *    2. Hill Climbing 是局部搜尋，[S5] 仕賢/彤彤 catClinic ≥10 天
- *       在假期集中的月份可能無法完全達標。
- *    3. 機動人員 countsAs:2；hill climbing 目前僅支援 1:1 對換，
- *       不支援「機動 ↔ 兩名一般人員」的複合交換。
- *    4. [H5] 連班限制在貪婪階段以篩選實作（非完整回溯），
- *       極端假期分布下可能使某幾天人力不足。
- *
- *  建議測試情境：
- *    a. 多人同週休假（5 人同週）→ 驗證每日人力不足偵測
- *    b. 週末密集的月份         → 驗證機動人員排班與 catClinic 人力
- *    c. 小加小柚同時多天休假   → 驗證 catClinic 人力補位（仕賢/彤彤）
- *    d. 雅卉整月休假           → 驗證小柚 H3 訓練配對改由樂樂/毛毛承擔
- *    e. 仕賢+彤彤各有 ≥7 天假 → 驗證 S5 警告是否正確列出
- *    f. 俊傑週二週五特別多的月 → 驗證 H9 動態上限計算（如 2026/3）
- *    g. 全員零休假             → 驗證正常月份能否滿足所有硬規則
- * ════════════════════════════════════════════════════════════════
- */
 
 export { validateHardRules };
