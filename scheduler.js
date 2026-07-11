@@ -925,9 +925,14 @@ function computeScore(dayMap, y, m, maxWorkdays) {
   const { score } = scoreSoftRules(dayMap, y, m);
   const unfilled = computeUnfilled(dayMap, y, m);
   const hard = validateHardRules(dayMap, y, m, maxWorkdays);
-  return score
-    - hard.length * 300
-    - unfilled.reduce((sum, u) => sum + u.shortBy * 40, 0);
+  // 缺口懲罰以「天」為單位採超線性（40·s + 35·s²，s = 當天總缺額）：
+  // 總缺額相同時，集中在少數天（如月底連缺 3 人或同日兩位置各缺 1）
+  // 的罰分遠高於平均分散，讓 hill climbing 主動把大缺攤平成偶發缺 1
+  const dayShort = new Map();
+  for (const u of unfilled) dayShort.set(u.day, (dayShort.get(u.day) ?? 0) + u.shortBy);
+  let gapPenalty = 0;
+  for (const sTot of dayShort.values()) gapPenalty += sTot * 40 + sTot * sTot * 35;
+  return score - hard.length * 300 - gapPenalty;
 }
 
 /**
@@ -1020,7 +1025,12 @@ function hillClimbStep(dayMap, total, y, m, availMap, maxWorkdays, lockedSet = n
       arr1.push(n2);
       names2.splice(idx2, 1);
 
-      if (isDayValid(d1, dayMap, y, m, prePow1) && isDayValid(d2, dayMap, y, m, prePow2)) {
+      // d2 允許該位置人力減少（從滿編日調人攤平缺口），
+      // 淨效益由 computeScore 的超線性缺口懲罰把關
+      const relaxed2 = { ...prePow2 };
+      relaxed2[pos] = Math.max(0, (relaxed2[pos] ?? 0) - (staffByName.get(n2)?.countsAs ?? 1));
+
+      if (isDayValid(d1, dayMap, y, m, prePow1) && isDayValid(d2, dayMap, y, m, relaxed2)) {
         const newScore = computeScore(dayMap, y, m, maxWorkdays);
         if (newScore > bestScore) {
           bestScore = newScore;
