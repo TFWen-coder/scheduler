@@ -1218,18 +1218,15 @@ function buildSidebarHTML() {
             <li>最多連上 <b>3 天</b>，前後各休 <b>2 天</b></li>
             <li>人力不足時每月可一次連上 <b>4 天</b></li>
             <li>避免「上一天休一天」交替</li>
-            <li>機動人員：限週末上班、人力算 <b>2 倍</b></li>
           </ul>
         </details>
 
         <details class="sb-sub" open>
           <summary>${arr('位置限制')}</summary>
           <ul>
-            <li><b>俊傑</b>：不上四樓；週二週五在外單位（各 8 小時）</li>
+            <li><b>俊傑</b>：不上四樓；週二週五跟診張醫師（各 8 小時計入工時）</li>
             <li><b>怡庭、燕姐</b>：只能<span class="sb-c">櫃台</span></li>
-            <li><b>莉婷</b>：不上<span class="sb-c">櫃台</span></li>
-            <li><b>小加、小柚</b>：只能<span class="sb-cat">貓診</span></li>
-            <li><b>機動</b>：不上<span class="sb-c">櫃台</span></li>
+            <li><b>慈顯、新人A</b>：只能<span class="sb-cat">貓診</span></li>
           </ul>
         </details>
 
@@ -1237,18 +1234,16 @@ function buildSidebarHTML() {
           <summary>${arr('訓練配對')}</summary>
           <ul>
             <li><b>莉婷</b>上<span class="sb-p">藥局</span> → 需<b>雅卉</b>或<b>樂樂</b>同班</li>
-            <li><b>小加</b>上<span class="sb-cat">貓診</span> → 需<b>仕賢／Erin／彤彤</b>至少一人</li>
-            <li><b>小柚</b>上<span class="sb-cat">貓診</span> → 需<b>雅卉／樂樂／毛毛</b>至少一人</li>
+            <li><b>慈顯</b>上<span class="sb-cat">貓診</span> → 需<b>雅卉／樂樂／毛毛</b>至少一人</li>
           </ul>
         </details>
 
         <details class="sb-sub" open>
           <summary>${arr('管理職偏好（可妥協）')}</summary>
           <ul>
-            <li><b>仕賢、彤彤</b>：<span class="sb-cat">貓診</span> ≥ 10 天／月（耗材管理）</li>
+            <li><b>仕賢、彤彤</b>：<span class="sb-cat">貓診</span> ≥ 6 天／月（耗材管理）</li>
             <li><b>雅卉</b>：盡量排<span class="sb-cat">貓診</span>（四樓管理）</li>
-            <li><b>樂樂、Erin、摩迪、維維</b>：<span class="sb-p">藥局</span>可多 1–2 天</li>
-            <li><b>毛毛、瑜庭、伊森</b>：<span class="sb-c">櫃台</span>可多 1–2 天</li>
+            <li><b>Erin</b>：避免與雅卉、樂樂、摩迪同位置</li>
           </ul>
         </details>
 
@@ -1256,7 +1251,7 @@ function buildSidebarHTML() {
     </details>
 
     <details class="sb-block" open>
-      <summary>${arr('👥 組員清單（17 人）')}</summary>
+      <summary>${arr('👥 組員清單（16 人）')}</summary>
       <div class="sb-content">
 
         <details class="sb-sub" open>
@@ -1266,12 +1261,7 @@ function buildSidebarHTML() {
 
         <details class="sb-sub" open>
           <summary>${arr('無證照（10 人）')}</summary>
-          <p class="sb-names">怡庭、燕姐、摩迪、瑜庭、彤彤、維維、伊森、莉婷、小加、小柚</p>
-        </details>
-
-        <details class="sb-sub" open>
-          <summary>${arr('機動人員（1 人）')}</summary>
-          <p class="sb-names">機動（限週末、人力 ×2）</p>
+          <p class="sb-names">怡庭、燕姐、摩迪、瑜庭、彤彤、維維、伊森、莉婷、慈顯、新人A</p>
         </details>
 
       </div>

@@ -576,8 +576,9 @@ function scoreSoftRules(dayMap, y, m) {
       }
     }
 
-    // [S4] 小加小柚同日
-    if (onDuty.has('小加') && onDuty.has('小柚')) xiaojiaXiaoyouOverlap++;
+    // [S4] 重疊配對同日（依 monthlyConstraints 設定；null = 停用）
+    const ocPair = monthlyConstraints.xiaojiaXiaoyouOverlap?.staff;
+    if (ocPair && onDuty.has(ocPair[0]) && onDuty.has(ocPair[1])) xiaojiaXiaoyouOverlap++;
 
     // [S2] avoidWith 違反（-5 分/次）
     const checked = new Set();
@@ -619,7 +620,7 @@ function scoreSoftRules(dayMap, y, m) {
       const leleAt = onDuty.get('樂樂');
       const exceptionA = liTingPos === 'pharmacy' && leleAt !== 'pharmacy';
       const catNamesDay = posMap.get('catClinic') ?? [];
-      const exceptionB = catNamesDay.includes('小加') || catNamesDay.includes('Erin');
+      const exceptionB = catNamesDay.includes('Erin');
       if (!exceptionA && !exceptionB) {
         score -= 2;
         violations.push({ ruleId: 'S6', message: `第${d}天雅卉排 ${onDuty.get('雅卉')} 而非 catClinic（無例外）`, day: d, staff: ['雅卉'] });
@@ -627,11 +628,14 @@ function scoreSoftRules(dayMap, y, m) {
     }
   }
 
-  // [S4] 重疊超限（-10/天超出）
-  const overlapExcess = Math.max(0, xiaojiaXiaoyouOverlap - monthlyConstraints.xiaojiaXiaoyouOverlap.maxDays);
-  if (overlapExcess > 0) {
-    score -= overlapExcess * 10;
-    violations.push({ ruleId: 'S4', message: `小加與小柚同日上班 ${xiaojiaXiaoyouOverlap} 天，超出上限 ${monthlyConstraints.xiaojiaXiaoyouOverlap.maxDays} 天`, staff: ['小加', '小柚'] });
+  // [S4] 重疊超限（-10/天超出；限制停用時跳過）
+  const oc = monthlyConstraints.xiaojiaXiaoyouOverlap;
+  if (oc) {
+    const overlapExcess = Math.max(0, xiaojiaXiaoyouOverlap - oc.maxDays);
+    if (overlapExcess > 0) {
+      score -= overlapExcess * 10;
+      violations.push({ ruleId: 'S4', message: `${oc.staff[0]}與${oc.staff[1]}同日上班 ${xiaojiaXiaoyouOverlap} 天，超出上限 ${oc.maxDays} 天`, staff: [...oc.staff] });
+    }
   }
 
   // [S5] 仕賢&彤彤 catClinic 天數下限（-3/天差距）
@@ -698,7 +702,9 @@ function softAvoidHit(p, onDuty) {
  * 檢查候選人是否使小加&小柚重疊超過上限 [S4]
  */
 function s4Blocked(p, onDuty, ctx) {
-  const [a, b] = monthlyConstraints.xiaojiaXiaoyouOverlap.staff;
+  const oc = monthlyConstraints.xiaojiaXiaoyouOverlap;
+  if (!oc) return false; // 重疊限制已停用
+  const [a, b] = oc.staff;
   const other = p.name === a ? b : p.name === b ? a : null;
   if (!other) return false;
   if (!onDuty.has(other)) return false;
@@ -1228,7 +1234,7 @@ export function generateSchedule(year, month, vacations = {}, options = {}, pref
   onProgress?.({ stage: 'phase1', message: '階段 1：建構初始可行解…', percent: 0 });
   let lastProgressMs = Date.now();
 
-  const [s4a, s4b] = monthlyConstraints.xiaojiaXiaoyouOverlap.staff;
+  const s4pair = monthlyConstraints.xiaojiaXiaoyouOverlap?.staff ?? null;
 
   const buildInitial = (jitter) => {
     // 全新 dayMap（含預填）
@@ -1275,7 +1281,7 @@ export function generateSchedule(year, month, vacations = {}, options = {}, pref
       const posMap = dm.get(d);
       const dayNames = new Set();
       for (const names of posMap.values()) for (const n of names) dayNames.add(n);
-      if (dayNames.has(s4a) && dayNames.has(s4b)) c.overlapUsed++;
+      if (s4pair && dayNames.has(s4pair[0]) && dayNames.has(s4pair[1])) c.overlapUsed++;
       for (const n of posMap.get('catClinic') ?? []) {
         if (monthlyConstraints.catClinicManagement.staff.includes(n)) {
           c.catDays.set(n, (c.catDays.get(n) ?? 0) + 1);
