@@ -194,6 +194,18 @@ function isWorking(name, d, dayMap) {
 }
 
 /**
+ * 判斷某人第 d 天是否「實際在工作」：排班日或外單位日（跟診）皆算 [H10]
+ * @param {import('./data.js').StaffMember} p
+ */
+function isWorkingExt(p, d, dayMap, y, m) {
+  if (isWorking(p.name, d, dayMap)) return true;
+  return !!p.externalDuty?.weekdays.includes(weekdayOf(y, m, d));
+}
+
+// [H10] 含外單位日（跟診）的最大連續工作天數
+const MAX_COMBINED_STREAK = 4;
+
+/**
  * 判斷某人員在某星期是否「結構性不可排」（非真休息，不計入連班鋸齒）
  * @param {import('./data.js').StaffMember} person
  * @param {number} weekday  0=Sun … 6=Sat
@@ -218,6 +230,15 @@ const ELIG_EXCEPTION = 3; // 連 4 天例外（每月一次，人力不足時）
  */
 function h5Eligibility(p, d, dayMap, y, m, consec) {
   if (p.role !== 'regular') return { tier: ELIG_STRICT, continuing: false, streak: 0 };
+
+  // [H10] 外單位人員（俊傑）：跟診日視同上班日，含跟診連續不得超過 4 天
+  if (p.externalDuty) {
+    let extStreak = 0;
+    for (let dd = d - 1; dd >= 1 && isWorkingExt(p, dd, dayMap, y, m); dd--) extStreak++;
+    if (extStreak >= MAX_COMBINED_STREAK) {
+      return { tier: ELIG_NONE, continuing: false, streak: extStreak };
+    }
+  }
 
   const maxC    = monthlyConstraints.consecutive.maxDays;
   const maxE    = monthlyConstraints.consecutive.exceptionalMaxDays;
@@ -259,6 +280,16 @@ function h5Eligibility(p, d, dayMap, y, m, consec) {
  */
 function canInsertDay(p, d, dayMap, y, m, consec) {
   if (p.role !== 'regular') return { ok: true, exception: false };
+
+  // [H10] 外單位人員：插入後含跟診的連續工作天數不得超過 4 天
+  if (p.externalDuty) {
+    const totalX = daysInMonth(y, m);
+    let extBack = 0;
+    for (let dd = d - 1; dd >= 1 && isWorkingExt(p, dd, dayMap, y, m); dd--) extBack++;
+    let extFwd = 0;
+    for (let dd = d + 1; dd <= totalX && isWorkingExt(p, dd, dayMap, y, m); dd++) extFwd++;
+    if (extBack + 1 + extFwd > MAX_COMBINED_STREAK) return { ok: false, exception: false };
+  }
 
   const total   = daysInMonth(y, m);
   const maxC    = monthlyConstraints.consecutive.maxDays;
@@ -476,6 +507,28 @@ function validateHardRules(dayMap, y, m, maxWorkdays) {
     }
   }
 
+  // [H10] 外單位人員：跟診日視同上班日，含跟診連續不得超過 4 天
+  for (const p of staff) {
+    if (p.role !== 'regular' || !p.externalDuty) continue;
+    let run = 0, runStart = 0;
+    for (let d = 1; d <= total + 1; d++) {
+      const w = d <= total && isWorkingExt(p, d, dayMap, y, m);
+      if (w) {
+        if (run === 0) runStart = d;
+        run++;
+      } else {
+        if (run > MAX_COMBINED_STREAK) {
+          violations.push({
+            ruleId: 'H10',
+            message: `${p.name} 第${runStart}-${d - 1}天含跟診連續工作 ${run} 天，超過上限 ${MAX_COMBINED_STREAK} 天`,
+            staff: [p.name],
+          });
+        }
+        run = 0;
+      }
+    }
+  }
+
   // [H8][H9] 月工時上限
   for (const p of staff) {
     if (p.role === 'flex') continue;
@@ -656,6 +709,26 @@ function scoreSoftRules(dayMap, y, m) {
     const totalWork = Object.values(rec ?? {}).reduce((a, b) => a + b, 0);
     const avg = p.positions.length > 0 ? totalWork / p.positions.length : 0;
     if (prefDays >= avg + p.preferredExtraDays.extraDays[0]) score += 2;
+  }
+
+  // [S7] 單日孤班懲罰（-1.5/段）：盡量讓大家一次連上 2-3 天。
+  //   外單位日（跟診）視同上班日，「週一排班＋週二跟診」不算孤班
+  for (const p of staff) {
+    if (p.role !== 'regular') continue;
+    let singles = 0, run = 0;
+    for (let d = 1; d <= total + 1; d++) {
+      const w = d <= total && (isWorking(p.name, d, dayMap) ||
+        (p.externalDuty?.weekdays.includes(weekdayOf(y, m, d)) ?? false));
+      if (w) run++;
+      else {
+        if (run === 1) singles++;
+        run = 0;
+      }
+    }
+    if (singles > 0) {
+      score -= singles * 1.5;
+      violations.push({ ruleId: 'S7', message: `${p.name} 本月有 ${singles} 段僅上 1 天的班（盡量連上 2-3 天）`, staff: [p.name] });
+    }
   }
 
   // [S1] 位置分配偏離（-0.5/天偏離；權重低於 S2/S5/S6，避免互相打架）
